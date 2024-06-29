@@ -69,7 +69,7 @@
     directionalLight.position.set(1, 1, 1);
     scene.add(directionalLight);
 
-    const socket = new WebSocket(`ws://128a-24-182-115-9.ngrok-free.app`);
+    const socket = new WebSocket(`wss://128a-24-182-115-9.ngrok-free.app`);
 
     socket.onopen = function (e) {
         console.log("Connected to server");
