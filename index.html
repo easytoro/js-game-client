@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { margin: 0; }
+        canvas { display: block; }
+        #playerList { position: absolute; top: 10px; left: 10px; color: white; }
+        #instructions { position: absolute; bottom: 10px; left: 10px; color: white; }
+        #fps { position: absolute; top: 10px; right: 10px; color: white; }
+    </style>
+</head>
+<body>
+<div id="playerList"></div>
+<div id="instructions">Click on the plane to move</div>
+<div id="fps">FPS: 0</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+    const playerList = document.getElementById('playerList');
+    const fpsDisplay = document.getElementById('fps');
+    const gridSize = 1; // Size of each grid cell in 3D units
+    const playerSize = 0.4; // Size of the player sphere
+
+    let playerId;
+    let players = new Map();
+    let movementSpeed = 5; // Units per second
+    let targetX, targetY;
+    let lastUpdateTime;
+    let lastSentUpdateTime = 0;
+    const updateInterval = 50; // Send updates every 50ms
+    let clickTarget = null;
+    let isMouseDown = false;
+
+    // Three.js setup
+    const scene = new THREE.Scene();
+    const aspectRatio = window.innerWidth / window.innerHeight;
+    const frustumSize = 10;
+    const camera = new THREE.OrthographicCamera(
+        frustumSize * aspectRatio / -2,
+        frustumSize * aspectRatio / 2,
+        frustumSize / 2,
+        frustumSize / -2,
+        0.1,
+        1000
+    );
+    camera.position.set(0, 10, 0);
+    camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+    const renderer = new THREE.WebGLRenderer();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    // Create plane
+    const planeGeometry = new THREE.PlaneGeometry(10, 10);
+    const planeMaterial = new THREE.MeshBasicMaterial({ color: 0xcccccc, side: THREE.DoubleSide });
+    const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+    plane.rotation.x = Math.PI / 2;
+    scene.add(plane);
+
+    // Set up camera
+    camera.position.set(0, 5, 7);
+    camera.lookAt(plane.position);
+
+    // Add ambient light
+    const ambientLight = new THREE.AmbientLight(0x404040);
+    scene.add(ambientLight);
+
+    // Add directional light
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
+    directionalLight.position.set(1, 1, 1);
+    scene.add(directionalLight);
+
+    const socket = new WebSocket(`ws://24.182.115.9:3000`);
+
+    socket.onopen = function (e) {
+        console.log("Connected to server");
+    };
+
+    socket.onmessage = function (event) {
+        const { type, data } = JSON.parse(event.data);
+        console.log(`Received ${type} event:`, data);
+
+        switch (type) {
+            case 'initialState':
+                playerId = data.playerId;
+                movementSpeed = data.movementSpeed;
+                data.players.forEach(updatePlayer);
+                break;
+            case 'playerMove':
+                if (data.id !== playerId) {
+                    updatePlayer(data);
+                } else {
+                    players.get(playerId).serverX = data.x;
+                    players.get(playerId).serverY = data.y;
+                }
+                break;
+            case 'playerJoined':
+                updatePlayer(data);
+                break;
+            case 'playerReconnected':
+                updatePlayer(data);
+                break;
+            case 'playerLeft':
+                removePlayer(data.id);
+                break;
+            case 'movementSpeedUpdate':
+                movementSpeed = data.speed;
+                break;
+        }
+        updatePlayerList();
+    };
+
+    socket.onclose = function (event) {
+        console.log('Connection closed');
+    };
+
+    socket.onerror = function (error) {
+        console.log(`WebSocket error: ${error.message}`);
+    };
+
+    function updatePlayer(playerData) {
+        let player = players.get(playerData.id);
+        if (!player) {
+            const geometry = new THREE.SphereGeometry(playerSize / 2, 32, 32);
+            const material = new THREE.MeshPhongMaterial({ color: getPlayerColor(playerData.id) });
+            const sphere = new THREE.Mesh(geometry, material);
+            player = {
+                mesh: sphere,
+                x: playerData.x,
+                y: playerData.y,
+                serverX: playerData.x,
+                serverY: playerData.y,
+                localX: playerData.x,
+                localY: playerData.y,
+                velocityX: 0,
+                velocityY: 0,
+            };
+            scene.add(sphere);
+            players.set(playerData.id, player);
+        }
+
+        player.serverX = playerData.x;
+        player.serverY = playerData.y;
+
+        if (playerData.id !== playerId) {
+            player.localX = playerData.x;
+            player.localY = playerData.y;
+        }
+
+        updatePlayerPosition(player);
+    }
+
+    function updatePlayerPosition(player) {
+        player.mesh.position.set(player.localX * gridSize, playerSize / 2, player.localY * gridSize);
+    }
+
+    function removePlayer(id) {
+        const player = players.get(id);
+        if (player) {
+            scene.remove(player.mesh);
+            players.delete(id);
+        }
+    }
+
+    function getPlayerColor(id) {
+        const hue = parseInt(id) % 360;
+        return new THREE.Color(`hsl(${hue}, 70%, 50%)`);
+    }
+
+    function updatePlayerList() {
+        playerList.innerHTML = Array.from(players.values())
+            .map(player =>
+                `Player ${player.id}: (${player.localX.toFixed(2)}, ${player.localY.toFixed(2)})${player.id === playerId ? ' (You)' : ''}`
+            ).join('<br>');
+    }
+
+    function updateTargetPosition(e) {
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+        mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObject(plane);
+        if (intersects.length > 0) {
+            const point = intersects[0].point;
+            targetX = point.x / gridSize;
+            targetY = point.z / gridSize;
+            clickTarget = { x: targetX, y: targetY };
+        }
+    }
+
+    let playerVelocityX = 0;
+    let playerVelocityY = 0;
+    const acceleration = 10; // Adjust this value to change how quickly the player accelerates
+    const deceleration = 15; // Adjust this value to change how quickly the player decelerates
+
+    let lastPosition = { x: 0, y: 0 };
+
+    function movePlayer(currentTime) {
+        const player = players.get(playerId);
+        if (!player) return;
+
+        const deltaTime = (currentTime - (lastUpdateTime || currentTime)) / 1000; 
+        lastUpdateTime = currentTime;
+
+        if (clickTarget) { // Re-added the click-to-move logic
+            const dx = clickTarget.x - player.localX;
+            const dy = clickTarget.y - player.localY;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+
+            if (distance > 0.01) {
+                // Calculate desired velocity
+                const desiredVelocityX = (dx / distance) * movementSpeed;
+                const desiredVelocityY = (dy / distance) * movementSpeed;
+
+                // Directly set velocity for immediate movement
+                player.localX += desiredVelocityX * deltaTime;
+                player.localY += desiredVelocityY * deltaTime;
+
+                updatePlayerPosition(player);
+
+                // Only send update if position has changed
+                if (player.localX !== lastPosition.x || player.localY !== lastPosition.y) {
+                    sendPositionUpdate(player);
+                    lastPosition.x = player.localX;
+                    lastPosition.y = player.localY;
+                }
+            } else {
+                // Player has reached the target
+                clickTarget = null;
+            }
+        } 
+
+        requestAnimationFrame(movePlayer);
+    }
+
+    function interpolatePlayerPosition(deltaTime) {
+        const player = players.get(playerId);
+        if (!player) return;
+
+        let differenceX = player.serverX - player.localX;
+        let differenceY = player.serverY - player.localY;
+        let threshold = 0.01; 
+        let interpolationConstant = 0.1; 
+
+        // Only interpolate if the difference is significant
+        if (Math.abs(differenceX) > threshold || Math.abs(differenceY) > threshold) { 
+            if (Math.abs(differenceX) > threshold) {
+                player.localX += differenceX * deltaTime * interpolationConstant;
+            } else {
+                player.localX = player.serverX; 
+            }
+
+            if (Math.abs(differenceY) > threshold) {
+                player.localY += differenceY * deltaTime * interpolationConstant;
+            } else {
+                player.localY = player.serverY; 
+            }
+
+            updatePlayerPosition(player); 
+        } 
+    }
+
+    function sendPositionUpdate(player) {
+        if (Date.now() - lastSentUpdateTime > updateInterval) {
+            socket.send(JSON.stringify({
+                type: 'move',
+                data: { x: player.localX, y: player.localY }
+            }));
+            lastSentUpdateTime = Date.now();
+        }
+    }
+
+    renderer.domElement.addEventListener('mousedown', (e) => {
+        isMouseDown = true;
+        updateTargetPosition(e);
+        if (!lastUpdateTime) {
+            lastUpdateTime = performance.now();
+            requestAnimationFrame(movePlayer);
+        }
+    });
+
+    renderer.domElement.addEventListener('mousemove', (e) => {
+        if (isMouseDown) {
+            updateTargetPosition(e);
+        }
+    });
+
+    renderer.domElement.addEventListener('mouseup', () => {
+        isMouseDown = false;
+    });
+
+    // This handles the case where the mouse leaves the window while held down
+    renderer.domElement.addEventListener('mouseout', () => {
+        isMouseDown = false;
+    });
+
+    let lastFrameTime = performance.now();
+    let frameCount = 0;
+
+    function updateFPS() {
+        const currentTime = performance.now();
+        frameCount++;
+        if (currentTime - lastFrameTime >= 1000) {
+            fpsDisplay.textContent = `FPS: ${frameCount}`;
+            frameCount = 0;
+            lastFrameTime = currentTime;
+        }
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+        updateFPS();
+        renderer.render(scene, camera);
+        const currentTime = performance.now();
+        const deltaTime = (currentTime - lastUpdateTime) / 1000;
+        interpolatePlayerPosition(deltaTime);
+    }
+    animate();
+
+    // Handle window resizing
+    window.addEventListener('resize', onWindowResize, false);
+a
+    function onWindowResize() {
+        const aspectRatio = window.innerWidth / window.innerHeight;
+        camera.left = frustumSize * aspectRatio / -2;
+        camera.right = frustumSize * aspectRatio / 2;
+        camera.top = frustumSize / 2;
+        camera.bottom = frustumSize / -2;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+</script>
+</body>
+</html>
